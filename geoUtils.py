@@ -1,8 +1,12 @@
 import rasterio
 import webbrowser
 from rasterio.warp import reproject, Resampling, calculate_default_transform
+from rasterio.merge import merge
+from rasterio.warp import transform_bounds
+from rasterio.windows import from_bounds
 import numpy as np
 import os
+import traceback
 
 def openPin(latitude,longitude):
     # Create the Google Maps URL with a pin
@@ -28,6 +32,9 @@ class Geotiff():
         print("Imported GeoTiff:",path)
         print("W=",self.width,"H=",self.height)
         print("Bounds","l:",left,"b:", bottom,"r:", right,"t:", top)
+
+        if (self.transform.b == 0 and self.transform.d == 0):
+            print("Image alligned to north")
 
     def coord2pixel(self,lat,long):
         return(self.inv_transform * (long, lat))
@@ -233,6 +240,82 @@ def create_colored_point_cloud_and_mesh(height_array, rgb_color_array,resolution
     o3d.visualization.draw_geometries([mesh,coordinate_frame], window_name="Colored Mesh from DEM")
 
 
+def convert_image_to_geotiff(input_image_path, output_geotiff_path):
+    """
+    Converts a raster image (JPG, TIFF, PNG, etc.) with an accompanying world file
+    and an optional auxiliary file (.aux.xml) into a GeoTIFF.
+    This function inherently supports multispectral TIFFs as rasterio handles
+    multi-band data automatically.
+
+    Args:
+        input_image_path (str): Path to the input image file (e.g., .jpg, .tif, .png).
+        output_geotiff_path (str): Path for the output GeoTIFF file.
+    """
+    # Get the base name and extension of the input image
+    base_name, ext = os.path.splitext(input_image_path)
+
+    # Determine potential world file paths. Rasterio often finds these automatically
+    # if they share the same base name and are in the same directory.
+    # Common world file extensions: .jpw for JPG, .tfw for TIF, .pgw for PNG, or generic .wld
+    # We'll check for the generic .wld and a specific one based on the input extension.
+    wld_path_generic = base_name + '.wld'
+    wld_path_specific = base_name + ext[1] + 'w' # e.g., .jpg -> .jpw, .tif -> .tfw
+
+    # Auxiliary file path (often .aux.xml)
+    aux_path = input_image_path + '.aux.xml'
+
+    # Check for the existence of world file (prioritize specific, then generic)
+    world_file_found = False
+    if os.path.exists(wld_path_specific):
+        print(f"Found specific world file: {wld_path_specific}")
+        world_file_found = True
+    elif os.path.exists(wld_path_generic):
+        print(f"Found generic world file: {wld_path_generic}")
+        world_file_found = True
+    else:
+        print(f"Error: No world file found for {input_image_path} at {wld_path_specific} or {wld_path_generic}")
+        print("A world file (.wld, .jpw, .tfw, etc.) is crucial for georeferencing.")
+        return
+
+    # Check for auxiliary file
+    if not os.path.exists(aux_path):
+        print(f"Warning: Auxiliary file not found at {aux_path}. CRS information might be missing or inferred.")
+        print("It's recommended to have the .aux.xml file for accurate Coordinate Reference System (CRS) information.")
+
+    try:
+        # rasterio will automatically pick up the .wld (or specific world file)
+        # and .aux.xml files if they are in the same directory and have matching base names.
+        with rasterio.open(input_image_path) as src:
+            print(f"Successfully opened {input_image_path} with georeferencing.")
+            print(f"Input image has {src.count} band(s).") # This will show if it's multispectral
+
+            # Get the profile (metadata) for the new GeoTIFF
+            profile = src.profile.copy()
+
+            # Update driver to GeoTIFF
+            profile.update(driver='GTiff')
+
+            # Rasterio automatically handles the dtype and band count from the source.
+            # If your input is a multispectral TIFF, src.count will be > 1,
+            # and src.read() will return a 3D array (bands, height, width).
+            image_data = src.read()
+
+            # Write the data to a new GeoTIFF file
+            with rasterio.open(output_geotiff_path, 'w', **profile) as dst:
+                dst.write(image_data)
+
+            print(f"\nGeoTIFF created successfully: {output_geotiff_path}")
+            print(f"Output CRS: {src.crs}")
+            print(f"Output Transform: {src.transform}")
+            print(f"Output Resolution: {src.res}")
+            print(f"Output Bands: {dst.count}")
+
+    except rasterio.errors.RasterioIOError as e:
+        print(f"Error reading or writing raster: {e}")
+        print("Please ensure the input file is a valid image format and GDAL drivers are correctly installed.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
 def create_geotiff_from_jpg_world(jpg_path, output_geotiff_path):
     """
     Creates a GeoTIFF from a JPG image, a world file (.wld), and an auxiliary file (.aux).
@@ -263,8 +346,8 @@ def create_geotiff_from_jpg_world(jpg_path, output_geotiff_path):
             profile = src.profile.copy()
 
             # Update driver to GeoTIFF
-            profile.update(driver='GTiff')
-
+            profile.update(driver='GTiff',tiled=True,blockysize=16)  # Must be multiple of 16,photometric='RGB',compress='lzw')
+            print("Profile:",profile)
             # USGS data is often 8-bit, so float32 might be overkill unless you
             # plan to do complex processing later. Keep original dtype for now.
             # If your JPG is RGB, src.count will be 3, src.read() will return 3D array.
@@ -274,7 +357,8 @@ def create_geotiff_from_jpg_world(jpg_path, output_geotiff_path):
             # Read the image data
             # If it's RGB, it will be (bands, height, width) automatically
             image_data = src.read()
-
+            print("Data shape:",image_data.shape)
+            print("TIF count :",src.count)
             # Write the data to a new GeoTIFF file
             with rasterio.open(output_geotiff_path, 'w', **profile) as dst:
                 dst.write(image_data)
@@ -286,8 +370,10 @@ def create_geotiff_from_jpg_world(jpg_path, output_geotiff_path):
 
     except rasterio.errors.RasterioIOError as e:
         print(f"Error reading or writing raster: {e}")
+        traceback.print_exc()  # This prints the full traceback including the underlying cause
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+        traceback.print_exc()  # This prints the full traceback including the underlying cause
 
 
 def reproject_utm_to_latlon(input_utm_geotiff_path, output_latlon_geotiff_path, target_resolution_degrees=None):
@@ -365,3 +451,77 @@ def reproject_utm_to_latlon(input_utm_geotiff_path, output_latlon_geotiff_path, 
             #print(f"Angular Units: {reprojected_src.crs.angular_units}")
 
     return output_latlon_geotiff_path
+
+
+
+def combine_rasters(file1, file2, output_file, bbox=None):
+    """
+    Combine two raster files with optional cropping to a bounding box.
+
+    Parameters:
+    - file1, file2: Paths to input GeoTIFF files
+    - output_file: Path to save the combined GeoTIFF
+    - bbox: Optional bounding box (min_lon, min_lat, max_lon, max_lat) in WGS84
+    """
+
+    # Open datasets
+    with rasterio.open(file1) as src1, rasterio.open(file2) as src2:
+        if bbox:
+            # Transform bbox from WGS84 (lat/lon) to dataset CRS
+            bbox_transformed = transform_bounds("EPSG:4326", src1.crs, *bbox)
+            win1 = from_bounds(*bbox_transformed, transform=src1.transform)
+            win2 = from_bounds(*bbox_transformed, transform=src2.transform)
+            data1 = src1.read(window=win1)
+            data2 = src2.read(window=win2)
+
+            # Update transforms for cropped data
+            transform1 = src1.window_transform(win1)
+            transform2 = src2.window_transform(win2)
+
+            meta = src1.meta.copy()
+            meta.update({
+                "height": data1.shape[1],
+                "width": data1.shape[2],
+                "transform": transform1
+            })
+
+            # Write temporary cropped rasters to memory files
+            with rasterio.io.MemoryFile() as memfile1, rasterio.io.MemoryFile() as memfile2:
+                with memfile1.open(**meta) as tmp1, memfile2.open(**meta) as tmp2:
+                    tmp1.write(data1)
+                    tmp2.write(data2)
+                    merged_data, merged_transform = merge([tmp1, tmp2])
+        else:
+            # Merge without cropping
+            merged_data, merged_transform = merge([src1, src2])
+            meta = src1.meta.copy()
+
+        # Update metadata for the output
+        meta.update({
+            "height": merged_data.shape[1],
+            "width": merged_data.shape[2],
+            "transform": merged_transform
+        })
+
+        # Write the output file
+        with rasterio.open(output_file, "w", **meta) as dest:
+            dest.write(merged_data)
+
+
+def cvtCoord_deg2dec(latitude:str = '',longitude:str = ''):
+    """
+    @brief Converts coordinates in degrees in the form <20-55-70.010N> <32-11-50.000W> 
+    to decimal coordinates
+    """
+
+    if(latitude=='' or longitude==''):
+        raise(ValueError("Neither latitude nor longitude should be empty."))
+    
+    N = 'N' in latitude
+    d, m, s = map(float, latitude[:-1].split('-'))
+    latitude = (d + m / 60. + s / 3600.) * (1 if N else -1)
+    W = 'W' in longitude
+    d, m, s = map(float, longitude[:-1].split('-'))
+    longitude = (d + m / 60. + s / 3600.) * (-1 if W else 1)
+
+    return(latitude,longitude)

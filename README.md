@@ -30,3 +30,4 @@ An attempt to creating a digital twin of a camera inside a digital eleveation mo
 ## Dataset resources
 
 * https://glovis.usgs.gov/app : OrbView3 satellite. Pan 1m / MS 4m
+* https://browser.dataspace.copernicus.eu 
